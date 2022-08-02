@@ -33,7 +33,8 @@ type Context struct {
 	TopologicalGraph dag.AcyclicGraph
 	RootNode         string
 	GlobalHash       string
-	Lockfile         *fs.YarnLockfile
+	YarnLockfile     *fs.YarnLockfile
+	BerryLockfile    *fs.BerryLockfile
 	PackageManager   *packagemanager.PackageManager
 	// Used to arbitrate access to the graph. We parallelise most build operations
 	// and Go maps aren't natively threadsafe so this is needed.
@@ -138,11 +139,19 @@ func WithGraph(config *config.Config, turboJSON *fs.TurboJSON, cacheDir fs.Absol
 
 		// this should go into the packagemanager abstraction
 		if util.IsYarn(c.PackageManager.Name) {
-			lockfile, err := fs.ReadLockfile(rootpath, c.PackageManager.Name, cacheDir)
-			if err != nil {
-				return fmt.Errorf("yarn.lock: %w", err)
+			if util.IsYarnClassic(c.PackageManager.Name) {
+				lockfile, err := fs.ReadLockfile(rootpath, c.PackageManager.Name, cacheDir)
+				if err != nil {
+					return fmt.Errorf("yarn.lock: %w", err)
+				}
+				c.YarnLockfile = lockfile
+			} else {
+				lockfile, err := fs.ReadBerryLockfile(rootpath, c.PackageManager.Name, cacheDir)
+				if err != nil {
+					return fmt.Errorf("yarn.lock: %w", err)
+				}
+				c.BerryLockfile = lockfile
 			}
-			c.Lockfile = lockfile
 		}
 
 		if err := c.resolveWorkspaceRootDeps(config.RootPackageJSON); err != nil {
@@ -231,7 +240,13 @@ func (c *Context) resolveWorkspaceRootDeps(rootPackageJSON *fs.PackageJSON) erro
 		pkg.UnresolvedExternalDeps[dep] = version
 	}
 	if util.IsYarn(c.PackageManager.Name) {
-		pkg.SubLockfile = make(fs.YarnLockfile)
+		if util.IsYarnClassic(c.PackageManager.Name) {
+			pkg.YarnSubLockfile = make(fs.YarnLockfile)
+		} else if util.IsYarnBerry(c.PackageManager.Name) {
+			pkg.BerrySubLockfile = make(fs.BerryLockfile)
+		} else {
+			panic("unexpected yarn package manager")
+		}
 		c.resolveDepGraph(&lockfileWg, pkg.UnresolvedExternalDeps, depSet, seen, pkg)
 		lockfileWg.Wait()
 		pkg.ExternalDeps = make([]string, 0, depSet.Cardinality())
@@ -302,7 +317,8 @@ func (c *Context) populateTopologicGraphForPackageJSON(pkg *fs.PackageJSON, root
 		}
 	}
 
-	pkg.SubLockfile = make(fs.YarnLockfile)
+	pkg.YarnSubLockfile = make(fs.YarnLockfile)
+	pkg.BerrySubLockfile = make(fs.BerryLockfile)
 	seen := mapset.NewSet()
 	var lockfileWg sync.WaitGroup
 	c.resolveDepGraph(&lockfileWg, pkg.UnresolvedExternalDeps, externalDepSet, seen, pkg)
@@ -369,30 +385,58 @@ func (c *Context) resolveDepGraph(wg *sync.WaitGroup, unresolvedDirectDeps map[s
 			seen.Add(lockfileKey1)
 			seen.Add(lockfileKey2)
 
-			var entry *fs.LockfileEntry
-			entry1, ok1 := (*c.Lockfile)[lockfileKey1]
-			entry2, ok2 := (*c.Lockfile)[lockfileKey2]
-			if !ok1 && !ok2 {
-				return
-			}
-			if ok1 {
-				lockfileKey = lockfileKey1
-				entry = entry1
+			if util.IsYarnClassic(c.PackageManager.Name) {
+				var entry *fs.YarnLockfileEntry
+				entry1, ok1 := (*c.YarnLockfile)[lockfileKey1]
+				entry2, ok2 := (*c.YarnLockfile)[lockfileKey2]
+				if !ok1 && !ok2 {
+					return
+				}
+				if ok1 {
+					lockfileKey = lockfileKey1
+					entry = entry1
+				} else {
+					lockfileKey = lockfileKey2
+					entry = entry2
+				}
+
+				pkg.Mu.Lock()
+				pkg.YarnSubLockfile[lockfileKey] = entry
+				pkg.Mu.Unlock()
+				resolvedDepsSet.Add(fmt.Sprintf("%v@%v", directDepName, entry.Version))
+
+				if len(entry.Dependencies) > 0 {
+					c.resolveDepGraph(wg, entry.Dependencies, resolvedDepsSet, seen, pkg)
+				}
+				if len(entry.OptionalDependencies) > 0 {
+					c.resolveDepGraph(wg, entry.OptionalDependencies, resolvedDepsSet, seen, pkg)
+				}
 			} else {
-				lockfileKey = lockfileKey2
-				entry = entry2
-			}
+				var entry *fs.BerryLockfileEntry
+				entry1, ok1 := (*c.BerryLockfile)[lockfileKey1]
+				entry2, ok2 := (*c.BerryLockfile)[lockfileKey2]
+				if !ok1 && !ok2 {
+					return
+				}
+				if ok1 {
+					lockfileKey = lockfileKey1
+					entry = entry1
+				} else {
+					lockfileKey = lockfileKey2
+					entry = entry2
+				}
 
-			pkg.Mu.Lock()
-			pkg.SubLockfile[lockfileKey] = entry
-			pkg.Mu.Unlock()
-			resolvedDepsSet.Add(fmt.Sprintf("%v@%v", directDepName, entry.Version))
+				pkg.Mu.Lock()
+				pkg.BerrySubLockfile[lockfileKey] = entry
+				pkg.Mu.Unlock()
+				resolvedDepsSet.Add(fmt.Sprintf("%v@%v", directDepName, entry.Version))
 
-			if len(entry.Dependencies) > 0 {
-				c.resolveDepGraph(wg, entry.Dependencies, resolvedDepsSet, seen, pkg)
-			}
-			if len(entry.OptionalDependencies) > 0 {
-				c.resolveDepGraph(wg, entry.OptionalDependencies, resolvedDepsSet, seen, pkg)
+				if len(entry.Dependencies) > 0 {
+					c.resolveDepGraph(wg, entry.Dependencies, resolvedDepsSet, seen, pkg)
+				}
+				if len(entry.OptionalDependencies) > 0 {
+					c.resolveDepGraph(wg, entry.OptionalDependencies, resolvedDepsSet, seen, pkg)
+				}
 			}
 
 		}(directDepName, unresolvedVersion)

@@ -16,8 +16,16 @@ type YarnRC struct {
 	NodeLinker string `yaml:"nodeLinker"`
 }
 
+func IsYarnClassic(backendName string) bool {
+	return backendName == "nodejs-yarn"
+}
+
+func IsYarnBerry(backendName string) bool {
+	return backendName == "nodejs-berry"
+}
+
 func IsYarn(backendName string) bool {
-	return backendName == "nodejs-yarn" || backendName == "nodejs-berry"
+	return IsYarnClassic(backendName) || IsYarnBerry(backendName)
 }
 
 func IsNMLinker(cwd string) (bool, error) {
