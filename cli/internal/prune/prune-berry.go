@@ -21,6 +21,8 @@ type deduplicatedLockfileEntry struct {
 	entry *fs.BerryLockfileEntry
 }
 
+const resolutionQuoteIdx = len("  resolution: \"") - 1
+
 // Prune creates a smaller monorepo with only the required workspaces
 func (p *prune) pruneBerry(opts *opts, outDir *fs.AbsolutePath, ctx *context.Context) error {
 	if isNMLinker, err := util.IsNMLinker(p.config.Cwd.ToStringDuringMigration()); err != nil {
@@ -79,7 +81,6 @@ func (p *prune) pruneBerry(opts *opts, outDir *fs.AbsolutePath, ctx *context.Con
 
 		for k, v := range ctx.PackageInfos[internalDep].BerrySubLockfile {
 			resolvedVersion := k[0:strings.LastIndex(k, "@")] + "@" + v.Version
-
 			if lockfileEntry, ok := deduplicatingLockfile[resolvedVersion]; !ok {
 				deduplicatingLockfile[resolvedVersion] = deduplicatedLockfileEntry{
 					entry: v,
@@ -106,9 +107,6 @@ func (p *prune) pruneBerry(opts *opts, outDir *fs.AbsolutePath, ctx *context.Con
 	for _, v := range deduplicatingLockfile {
 		sort.Strings(v.keys)
 		lockfilePackageVersion := strings.Join(v.keys, ", ")
-		if len(v.keys) > 1 {
-			print("here")
-		}
 		lockfile[lockfilePackageVersion] = v.entry
 	}
 
@@ -180,26 +178,55 @@ func (p *prune) pruneBerry(opts *opts, outDir *fs.AbsolutePath, ctx *context.Con
 	scan := bufio.NewScanner(generatedLockfile)
 	buf := make([]byte, 0, 2*1024*1024)
 	scan.Buffer(buf, 10*1024*1024)
+
+	// { "in-dependencies", "other", "after-dependencies" }
+	scanState := "other"
+
 	for scan.Scan() {
 		line := scan.Text() //Writing to Stdout
 		// Complex keys may start with `? `, remove them.
 		if strings.HasPrefix(line, "? ") {
 			line = line[2:]
 		} else if strings.HasPrefix(line, ":") {
-			line = line[1:] + " "
+			line = " " + line[1:]
 		}
 		if !strings.HasPrefix(line, " ") {
-			if strings.HasPrefix(line, "'") {
-				line = "\"" + line[1:len(line)-2] + "\":"
-			} else if !strings.HasPrefix(line, "\"") {
-				line = "\"" + line[:len(line)-1] + "\":"
-			}
-			if !strings.HasSuffix(line, "\"") {
+			if !strings.HasSuffix(line, ":") {
 				line = line + ":"
+			}
+			line = strings.ReplaceAll(line, "'", "\"")
+			if !strings.HasPrefix(line, "\"") {
+				line = "\"" + line[:len(line)-1] + "\":"
 			}
 			tmpGeneratedLockfileWriter.WriteString(fmt.Sprintf("\n%v\n", line))
 		} else {
 			// TODO: more performant string manipulation
+			if strings.HasPrefix(line, "  resolution") {
+				// quote the resolution if not already quoted
+				if line[resolutionQuoteIdx] == '\'' {
+					line = strings.ReplaceAll(line, "'", "\"")
+				} else {
+					line = line[:resolutionQuoteIdx] + "\"" + line[resolutionQuoteIdx:] + "\""
+				}
+			} else if strings.HasPrefix(line, "  dependencies") {
+				scanState = "in-dependencies"
+			} else if scanState == "in-dependencies" {
+				if !strings.HasPrefix(line, "    ") {
+					scanState = "after-dependencies"
+				} else {
+					// have to correct quotes for versions
+					indexOfColon := strings.Index(line, ": ")
+					dependencyVersion := line[indexOfColon+2:]
+					if strings.HasPrefix(dependencyVersion, "\"") {
+						// have to determine if this quote is appropriate
+						// `debug: "4"` should be `debug: 4`
+						if !strings.Contains(dependencyVersion, ">") && !strings.Contains(dependencyVersion, "<") {
+							dependencyVersion = dependencyVersion[1 : len(dependencyVersion)-1]
+							line = line[:indexOfColon+2] + dependencyVersion
+						}
+					}
+				}
+			}
 			newLine := fmt.Sprintf("%v\n", strings.ReplaceAll(line, "'", "\""))
 			tmpGeneratedLockfileWriter.WriteString(newLine)
 		}

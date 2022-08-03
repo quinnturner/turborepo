@@ -138,20 +138,18 @@ func WithGraph(config *config.Config, turboJSON *fs.TurboJSON, cacheDir fs.Absol
 		}
 
 		// this should go into the packagemanager abstraction
-		if util.IsYarn(c.PackageManager.Name) {
-			if util.IsYarnClassic(c.PackageManager.Name) {
-				lockfile, err := fs.ReadLockfile(rootpath, c.PackageManager.Name, cacheDir)
-				if err != nil {
-					return fmt.Errorf("yarn.lock: %w", err)
-				}
-				c.YarnLockfile = lockfile
-			} else {
-				lockfile, err := fs.ReadBerryLockfile(rootpath, c.PackageManager.Name, cacheDir)
-				if err != nil {
-					return fmt.Errorf("yarn.lock: %w", err)
-				}
-				c.BerryLockfile = lockfile
+		if util.IsYarnClassic(c.PackageManager.Name) {
+			lockfile, err := fs.ReadLockfile(rootpath, c.PackageManager.Name, cacheDir)
+			if err != nil {
+				return fmt.Errorf("yarn.lock: %w", err)
 			}
+			c.YarnLockfile = lockfile
+		} else if util.IsYarnBerry(c.PackageManager.Name) {
+			lockfile, err := fs.ReadBerryLockfile(rootpath, c.PackageManager.Name, cacheDir)
+			if err != nil {
+				return fmt.Errorf("yarn.lock: %w", err)
+			}
+			c.BerryLockfile = lockfile
 		}
 
 		if err := c.resolveWorkspaceRootDeps(config.RootPackageJSON); err != nil {
