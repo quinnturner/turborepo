@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/vercel/turborepo/cli/internal/context"
@@ -14,6 +15,11 @@ import (
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v3"
 )
+
+type deduplicatedLockfileEntry struct {
+	keys  []string
+	entry *fs.BerryLockfileEntry
+}
 
 // Prune creates a smaller monorepo with only the required workspaces
 func (p *prune) pruneBerry(opts *opts, outDir *fs.AbsolutePath, ctx *context.Context) error {
@@ -38,6 +44,8 @@ func (p *prune) pruneBerry(opts *opts, outDir *fs.AbsolutePath, ctx *context.Con
 		return errors.Wrap(err, "could find traverse the dependency graph to find topological dependencies")
 	}
 	targets = append(targets, internalDeps.List()...)
+
+	deduplicatingLockfile := map[string]deduplicatedLockfileEntry{}
 
 	for _, internalDep := range targets {
 		if internalDep == ctx.RootNode {
@@ -70,16 +78,40 @@ func (p *prune) pruneBerry(opts *opts, outDir *fs.AbsolutePath, ctx *context.Con
 		}
 
 		for k, v := range ctx.PackageInfos[internalDep].BerrySubLockfile {
-			if strings.HasPrefix(k, "__metadata") {
-				lockfileVersion = v.Version
-				lockfileCacheKey = v.CacheKey
+			resolvedVersion := k[0:strings.LastIndex(k, "@")] + "@" + v.Version
+
+			if lockfileEntry, ok := deduplicatingLockfile[resolvedVersion]; !ok {
+				deduplicatingLockfile[resolvedVersion] = deduplicatedLockfileEntry{
+					entry: v,
+					keys:  []string{k},
+				}
 			} else {
-				lockfile[k] = v
+				found := false
+				for _, entry := range lockfileEntry.keys {
+					if entry == k {
+						found = true
+						break
+					}
+				}
+				if !found {
+					lockfileEntry.keys = append(lockfileEntry.keys, k)
+					deduplicatingLockfile[resolvedVersion] = lockfileEntry
+				}
 			}
 		}
 
 		p.ui.Output(fmt.Sprintf(" - Added %v", ctx.PackageInfos[internalDep].Name))
 	}
+
+	for _, v := range deduplicatingLockfile {
+		sort.Strings(v.keys)
+		lockfilePackageVersion := strings.Join(v.keys, ", ")
+		if len(v.keys) > 1 {
+			print("here")
+		}
+		lockfile[lockfilePackageVersion] = v.entry
+	}
+
 	p.logger.Trace("new workspaces", "value", workspaces)
 	if opts.docker {
 		if fs.FileExists(".gitignore") {
@@ -146,14 +178,30 @@ func (p *prune) pruneBerry(opts *opts, outDir *fs.AbsolutePath, ctx *context.Con
 	}
 
 	scan := bufio.NewScanner(generatedLockfile)
-	buf := make([]byte, 0, 1024*1024)
+	buf := make([]byte, 0, 2*1024*1024)
 	scan.Buffer(buf, 10*1024*1024)
 	for scan.Scan() {
 		line := scan.Text() //Writing to Stdout
+		// Complex keys may start with `? `, remove them.
+		if strings.HasPrefix(line, "? ") {
+			line = line[2:]
+		} else if strings.HasPrefix(line, ":") {
+			line = line[1:] + " "
+		}
 		if !strings.HasPrefix(line, " ") {
-			tmpGeneratedLockfileWriter.WriteString(fmt.Sprintf("\n%v\n", strings.ReplaceAll(line, "'", "\"")))
+			if strings.HasPrefix(line, "'") {
+				line = "\"" + line[1:len(line)-2] + "\":"
+			} else if !strings.HasPrefix(line, "\"") {
+				line = "\"" + line[:len(line)-1] + "\":"
+			}
+			if !strings.HasSuffix(line, "\"") {
+				line = line + ":"
+			}
+			tmpGeneratedLockfileWriter.WriteString(fmt.Sprintf("\n%v\n", line))
 		} else {
-			tmpGeneratedLockfileWriter.WriteString(fmt.Sprintf("%v\n", strings.ReplaceAll(line, "'", "\"")))
+			// TODO: more performant string manipulation
+			newLine := fmt.Sprintf("%v\n", strings.ReplaceAll(line, "'", "\""))
+			tmpGeneratedLockfileWriter.WriteString(newLine)
 		}
 	}
 	// Make sure to flush the log write before we start saving it.
